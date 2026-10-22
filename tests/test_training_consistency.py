@@ -182,9 +182,83 @@ def test_resume_state():
     print("[resume] ALL RESUME CHECKS PASSED")
 
 
+def test_resume_missing_weights_raises():
+    """_resume must fail loudly on an incomplete checkpoint, not silently train from the passed-in model."""
+    import shutil
+
+    cfg = replace(small_config(), block_size=4)
+    ckpt = Path("/tmp/tm_resume_missing")
+    shutil.rmtree(ckpt, ignore_errors=True)
+    ckpt.mkdir(parents=True)
+
+    # config.json + training_state.pt present, but NO model weights.
+    model = TimestralModel(cfg)
+    model.config.save(ckpt / "config.json")
+    torch.save({"optimizer_state": {}, "step": 5}, ckpt / "training_state.pt")
+
+    try:
+        Trainer(model, DEVICE, per_block_patches=4, resume_from=ckpt)
+        raise AssertionError("expected FileNotFoundError for missing model weights")
+    except FileNotFoundError as e:
+        assert "model weights" in str(e), f"unexpected error message: {e}"
+        print(f"[resume] missing weights -> FileNotFoundError: {e}")
+
+    # Now also exercise the missing-config path on a fully-written checkpoint.
+    ok = Path("/tmp/tm_resume_complete")
+    shutil.rmtree(ok, ignore_errors=True)
+    tr = Trainer(TimestralModel(cfg), DEVICE, per_block_patches=4, log_every=0, checkpoint_dir=ok)
+    tr.save_checkpoint(ok / "last")
+    (ok / "last" / "config.json").unlink()
+    try:
+        Trainer(TimestralModel(cfg), DEVICE, per_block_patches=4, resume_from=ok / "last")
+        raise AssertionError("expected FileNotFoundError for missing config.json")
+    except FileNotFoundError as e:
+        assert "config.json" in str(e), f"unexpected error message: {e}"
+        print(f"[resume] missing config -> FileNotFoundError: {e}")
+    print("[resume] incomplete-checkpoint guard OK")
+
+
+def test_resume_sample_order():
+    """After resume, the DataLoader must replay the same next sample as an uninterrupted run."""
+    rng = np.random.default_rng(11)
+    series = [rng.standard_normal((2, 1000)).cumsum(-1).astype(np.float32) for _ in range(16)]
+    ds = RollingWindowDataset(series, PS, 8, 4, seed=12)
+    mk = lambda: DataLoader(ds, batch_size=8, shuffle=True, collate_fn=collate_windows, num_workers=0)
+    cfg = replace(small_config(), block_size=4)
+
+    A = Path("/tmp/tm_resume_order_a")
+    if A.exists():
+        import shutil
+        shutil.rmtree(A)
+    tr_a = Trainer(TimestralModel(cfg), DEVICE, per_block_patches=4, max_context=cfg.context_length,
+                   log_every=0, checkpoint_dir=A)
+    tr_a.fit(mk(), total_steps=6, val_every=9999, checkpoint_every=9999)
+
+    saved = torch.load(A / "last" / "training_state.pt", map_location="cpu", weights_only=False)["sampler_rng"]
+
+    # Uninterrupted continuation: a fresh loader with the saved generator state.
+    loader_a = mk()
+    Trainer._sampler_generator(loader_a).set_state(saved)
+    batch_a = next(iter(loader_a))
+
+    # Resumed continuation: a different loader restored via the trainer.
+    tr_b = Trainer(TimestralModel(cfg), DEVICE, per_block_patches=4, max_context=cfg.context_length,
+                   log_every=0, resume_from=A / "last")
+    loader_b = mk()
+    tr_b._train_loader = loader_b
+    tr_b._restore_sampler_rng()
+    batch_b = next(iter(loader_b))
+
+    for i in range(len(batch_a)):
+        assert torch.equal(batch_a[i], batch_b[i]), f"resumed sample replay diverged at field {i}"
+    print("[resume] sample ordering replayed identically after resume; OK")
+
+
 if __name__ == "__main__":
     test_decode_consistency()
     test_training_reduces_loss()
     test_validation_deterministic()
     test_resume_state()
+    test_resume_missing_weights_raises()
+    test_resume_sample_order()
     print("\nALL CONSISTENCY TESTS PASSED")

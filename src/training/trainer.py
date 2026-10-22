@@ -179,15 +179,31 @@ class Trainer:
     def _resume(self, path: Path) -> None:
         from safetensors.torch import load_model as load_safetensors
 
+        # Fail fast and loudly on an incomplete checkpoint instead of silently
+        # training from the (wrong) model passed in. A missing weights file in
+        # particular would otherwise start training as if no resume happened.
+        weights = path / "model.safetensors"
+        live = path / "model_live.safetensors"
+        training_state = path / "training_state.pt"
+        config = path / "config.json"
+        missing = []
+        if not (weights.is_file() or live.is_file()):
+            missing.append("model weights (model.safetensors / model_live.safetensors)")
+        if not training_state.is_file():
+            missing.append("training_state.pt")
+        if not config.is_file():
+            missing.append("config.json")
+        if missing:
+            raise FileNotFoundError(
+                f"checkpoint at {path} is incomplete, missing: {', '.join(missing)}"
+            )
+
         # `model.safetensors` holds the EMA (deployment) weights; the *live*
         # training weights are stored separately as `model_live.safetensors` so
         # training resumes from the exact parameters (and keeps EMA moving).
         # Older checkpoints without the live copy fall back to the EMA weights.
-        live = path / "model_live.safetensors"
-        weights = path / "model.safetensors"
         src = live if live.is_file() else weights
-        if src.is_file():
-            load_safetensors(self.model, str(src))
+        load_safetensors(self.model, str(src))
         state = load_training_state(path)
         if state is None:
             raise FileNotFoundError(f"no training_state.pt found in {path}")
@@ -206,6 +222,8 @@ class Trainer:
         # Continue the same best-model / early-stop trajectory across resumes.
         self.best_val = float(state.get("best_val", float("inf")))
         self.patience = int(state.get("patience", 0))
+        # Sampler RNG state, applied onto the DataLoader's generator in `fit`.
+        self._sampler_rng = state.get("sampler_rng")
         if "rng_state" in state:
             rng = state["rng_state"]
             if "torch" in rng:
@@ -216,6 +234,10 @@ class Trainer:
                 np.random.set_state(rng["numpy"])
             if "cuda" in rng and torch.cuda.is_available():
                 torch.cuda.set_rng_state_all(rng["cuda"])
+            if "random" in rng:
+                import random
+
+                random.setstate(rng["random"])
         print(f"[Trainer] resumed from step {self.step} (best_val={self.best_val:.4f}, patience={self.patience})")
 
     # ---- packing -------------------------------------------------------------
@@ -470,12 +492,37 @@ class Trainer:
                 self.ema[n].mul_(d).add_(p.detach(), alpha=1.0 - d)
 
     def _rng_state(self) -> dict[str, Any]:
+        import random
+
         import numpy as np
 
-        state: dict[str, Any] = {"torch": torch.random.get_rng_state(), "numpy": np.random.get_state()}
+        state: dict[str, Any] = {
+            "torch": torch.random.get_rng_state(),
+            "numpy": np.random.get_state(),
+            "random": random.getstate(),
+        }
         if torch.cuda.is_available():
             state["cuda"] = torch.cuda.get_rng_state_all()
         return state
+
+    @staticmethod
+    def _sampler_generator(loader) -> Any:
+        """Return the DataLoader's sampler RNG generator, if it has one."""
+        sampler = getattr(loader, "sampler", None)
+        return getattr(sampler, "generator", None) if sampler is not None else None
+
+    def _capture_sampler_rng(self) -> None:
+        """Snapshot the DataLoader sampler's RNG state for exact sample replay."""
+        gen = self._sampler_generator(self._train_loader)
+        self._sampler_rng = gen.get_state() if gen is not None else None
+
+    def _restore_sampler_rng(self) -> None:
+        """Apply the saved sampler RNG state onto the current DataLoader."""
+        if self._sampler_rng is None or self._train_loader is None:
+            return
+        gen = self._sampler_generator(self._train_loader)
+        if gen is not None:
+            gen.set_state(self._sampler_rng)
 
     # ---- training loop -------------------------------------------------------
     @contextlib.contextmanager
@@ -538,7 +585,10 @@ class Trainer:
         early_stop_patience: int | None = None,
     ) -> dict:
         self.model.train()
+        self._train_loader = train_loader
         start_step = self.step
+        # Replay the same sample ordering as before the interruption.
+        self._restore_sampler_rng()
         train_iter = iter(train_loader)
         history = {"train_loss": [], "val_loss": []}
         for step in range(start_step + 1, total_steps + 1):
@@ -613,6 +663,10 @@ class Trainer:
 
         save_safetensors(self.model, str(Path(path) / "model_live.safetensors"))
 
+        # Snapshot the sampler RNG state *now* (mid-epoch) so resume replays the
+        # same sample ordering from this point on.
+        self._capture_sampler_rng()
+
         # Always write training_state.pt alongside the weights so a single
         # directory is a resumable checkpoint.
         save_training_state(
@@ -623,4 +677,5 @@ class Trainer:
             ema=self.ema,
             best_val=self.best_val,
             patience=self.patience,
+            sampler_rng=self._sampler_rng,
         )

@@ -7,3 +7,4 @@ dist/
 *.safetensors
 
 train_example_out/
+train_air_out/

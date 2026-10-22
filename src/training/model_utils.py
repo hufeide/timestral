@@ -7,6 +7,7 @@ the released 209M-scale architecture for serious training.
 """
 
 from pathlib import Path
+from typing import Any
 
 import torch
 from safetensors.torch import save_model as save_safetensors
@@ -90,18 +91,20 @@ def save_training_state(
     ema: dict | None = None,
     best_val: float | None = None,
     patience: int | None = None,
+    sampler_rng: Any | None = None,
 ) -> None:
     """Save training-side state for checkpoint resumption.
 
-    Stores the optimizer, step and (optionally) RNG state, the EMA buffer, and
-    the best-validation / early-stop counters next to ``model.safetensors`` so a
-    single directory is a fully resumable checkpoint.
+    Stores the optimizer, step and (optionally) RNG state, the EMA buffer, the
+    best-validation / early-stop counters and the DataLoader sampler RNG next to
+    ``model.safetensors`` so a single directory is a fully resumable checkpoint.
 
     Args:
-        rng_state: dict from ``torch.random.get_rng_state()`` (+ numpy/cuda); ``None`` skips.
+        rng_state: dict from ``torch.random.get_rng_state()`` (+ numpy/cuda/random); ``None`` skips.
         ema: EMA parameter dict (``{name: tensor}``); ``None`` when EMA is off.
         best_val: best validation loss so far; ``None`` to omit.
         patience: early-stop patience counter; ``None`` to omit.
+        sampler_rng: ``torch.Generator.get_state()`` tensor for the DataLoader sampler; ``None`` to omit.
     """
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -117,6 +120,8 @@ def save_training_state(
         payload["best_val"] = float(best_val)
     if patience is not None:
         payload["patience"] = int(patience)
+    if sampler_rng is not None:
+        payload["sampler_rng"] = sampler_rng
     torch.save(payload, path / "training_state.pt")
 
 
