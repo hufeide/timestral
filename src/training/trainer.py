@@ -154,6 +154,10 @@ class Trainer:
         # resetting and possibly overwriting a better checkpoint.
         self.best_val = float("inf")
         self.patience = 0
+        # Sampler (DataLoader) RNG state captured at checkpoint time so a resumed
+        # run continues the same sample ordering. None until `fit` sets it.
+        self._sampler_rng = None
+        self._train_loader = None
         self.log_every = log_every
         self.checkpoint_dir = Path(checkpoint_dir) if checkpoint_dir is not None else None
         self.detach_feedback = bool(detach_feedback)
