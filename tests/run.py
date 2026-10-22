@@ -5,12 +5,12 @@ import matplotlib.pyplot as plt
 from timestral import TimestralForecaster
 
 model = TimestralForecaster.from_pretrained(
-    "/home/administator/workspace/hub/mistralai",
+    "/home/administator/workspace/hub/mistralai",#"/home/administator/workspace/timestral/train_stock_out/best",#
     device="cuda" if torch.cuda.is_available() else "cpu"
 )
 
 # Chinese CSV exported from Excel is GBK-encoded, not UTF-8.
-df = pd.read_csv("/home/administator/workspace/timestral/tests/2.csv", encoding="gbk")
+df = pd.read_csv("/home/administator/workspace/timestral/tests/stock.csv", encoding="gbk")
 
 price_cols = ["MiniMax(00100.HK)收盘价", "智谱(02513.HK)收盘价"]
 y = df[price_cols].to_numpy(dtype=float)         # (N, 2): two stock close prices
@@ -50,4 +50,6 @@ for v, ax in enumerate(axes):
 axes[-1].set_xlabel("time step")
 fig.suptitle("Timestral forecast vs. ground truth")
 fig.tight_layout()
+out_png = "/home/administator/workspace/timestral/tests/run_stock_forecast_org.png"
+fig.savefig(out_png, dpi=120)
 plt.show()
