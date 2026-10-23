@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 from timestral import TimestralForecaster
 
 model = TimestralForecaster.from_pretrained(
-    "/home/administator/workspace/timestral/train_stock_out/step200",#"/home/administator/workspace/hub/mistralai",
+    "/home/administator/workspace/timestral/train_stock_out/best",#"/home/administator/workspace/hub/mistralai",
     device="cuda" if torch.cuda.is_available() else "cpu",
 )
 
@@ -35,11 +35,25 @@ midx = model.config.median_index
 lo_idx = knots.index(0.1)
 hi_idx = knots.index(0.9)
 
+# Known-future covariates built over the full timeline so each rolling window can
+# take the slice covering its context + horizon. They encode the trend proxy and
+# monthly seasonality the model was fine-tuned on; without them the forecast falls
+# back to a flat prior and does not track the series.
+tt = np.arange(N, dtype=np.float32)
+known = np.stack([
+    (tt / max(1, N - 1)) * 2.0 - 1.0,            # normalized time index (trend proxy)
+    np.sin(2.0 * np.pi * (tt % 12) / 12.0),      # month seasonality
+    np.cos(2.0 * np.pi * (tt % 12) / 12.0),
+], axis=0)                                        # (3, N)
+
 pred_median, pred_lo, pred_hi = [], [], []
 ctx = y[:context_len].copy()                     # (context_len, V) rolling context
 for k in range(K):
+    s = k * STEP                                  # absolute start index of this window
     ctx_in = np.ascontiguousarray(ctx.T)[None]    # (1, V, context_len)
-    fc = model.forecast(ctx_in, prediction_length=STEP)
+    # known_covariates must span context + horizon: [s, s + context_len + STEP)
+    known_in = known[:, s : s + context_len + STEP][None]   # (1, 3, context_len + STEP)
+    fc = model.forecast(ctx_in, prediction_length=STEP, known_covariates=known_in)
     q = np.asarray(fc.quantiles.detach().cpu().numpy())[0]  # (V, STEP, Q)
     pred_median.append(q[:, :, midx])
     pred_lo.append(q[:, :, lo_idx])

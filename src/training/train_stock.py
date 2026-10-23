@@ -14,6 +14,12 @@ The single 100-point bivariate series is tiny, so this is a demonstration of the
 train -> save -> forecast -> plot loop rather than a benchmark. Known-future
 covariates (normalized time index + month-of-year sin/cos) give the model an
 explicit trend/seasonality signal that helps on such a short series.
+
+The held-out forecast uses a *rolling* 5-step scheme with refeeding of the true
+observations (rolling origin / walk-forward): each 5-step block is conditioned on
+correct recent history, so the 30 predicted points tile the horizon with no gaps
+and stay anchored to the real series instead of drifting over a single 30-step
+autoregressive decode.
 """
 
 import sys
@@ -55,6 +61,7 @@ BATCH = 16
 # How many trailing days to hold out for the forecast plot.
 CONTEXT_TRAIN = 70       # points used as forecast context
 HOLDOUT = 30             # days predicted and compared against actuals
+STEP = 5                 # rolling step: predict STEP, refeed true data, repeat
 
 
 def load_stock_csv(path: Path) -> tuple[np.ndarray, list[str]]:
@@ -140,26 +147,47 @@ def main() -> None:
     print(f"best  val  loss: {min(history['val_loss']):.4f}")
     print(f"checkpoints -> {OUT_DIR}  (best/last carry EMA weights + config.json)")
 
-    # --- forecast + plot (load the saved, EMA-smoothed checkpoint) ------------
+    # --- rolling forecast + plot (load the saved, EMA-smoothed checkpoint) ----
     best_ckpt = OUT_DIR / "best"
     fc = TimestralForecaster.from_pretrained(best_ckpt if best_ckpt.is_dir() else OUT_DIR, device=DEVICE)
-
-    ctx = torch.from_numpy(series[:, :CONTEXT_TRAIN][np.newaxis]).float().to(DEVICE)   # (1, V, 70)
-    known_fc = torch.from_numpy(known[:, : CONTEXT_TRAIN + HOLDOUT][np.newaxis]).float().to(DEVICE)
-    forecast = fc.forecast(ctx, HOLDOUT, known_covariates=known_fc, symmetric_averaging=True, clip_nonnegative=True)
 
     knots = list(fc.quantile_levels)
     midx = knots.index(0.5)
     lo_idx = knots.index(0.1)
     hi_idx = knots.index(0.9)
-    q = forecast.quantiles[0]                                   # (V, HOLDOUT, Q)
-    median = q[:, :, midx]
-    p10 = q[:, :, lo_idx]
-    p90 = q[:, :, hi_idx]
-    actual = series[:, CONTEXT_TRAIN:]                           # (V, HOLDOUT)
 
-    mae = float(np.mean(np.abs(median.cpu().numpy() - actual)))
-    print(f"held-out {HOLDOUT}-day MAE (median): {mae:.2f}")
+    # Rolling 5-step forecast with refeeding of true observations (rolling origin /
+    # walk-forward): each 5-step block is conditioned on correct recent history, so
+    # the 30 predicted points tile [CONTEXT_TRAIN, length) with no gaps and stay
+    # anchored to the real series. known_covariates must span each block's context
+    # + horizon: [s, s + context_len + STEP).
+    context_len = CONTEXT_TRAIN
+    pred_median, pred_lo, pred_hi = [], [], []
+    ctx = series[:, :context_len].copy()                     # (V, context_len) numpy
+    for k in range(HOLDOUT // STEP):
+        s = k * STEP
+        ctx_in = np.ascontiguousarray(ctx)[None]             # (1, V, context_len); series is (V, L)
+        known_in = known[:, s : s + context_len + STEP][None] # (1, 3, context_len + STEP)
+        fstep = fc.forecast(
+            ctx_in, STEP, known_covariates=known_in,
+            symmetric_averaging=True, clip_nonnegative=True,
+        )
+        q = np.asarray(fstep.quantiles.detach().cpu().numpy())[0]  # (V, STEP, Q)
+        pred_median.append(q[:, :, midx])
+        pred_lo.append(q[:, :, lo_idx])
+        pred_hi.append(q[:, :, hi_idx])
+        # Slide the window forward by STEP, refeeding the true observations this
+        # block just predicted against (rolling origin).
+        new_rows = series[:, context_len + k * STEP : context_len + (k + 1) * STEP]
+        ctx = np.concatenate([ctx[:, STEP:], new_rows], axis=1)
+
+    median = np.concatenate(pred_median, axis=1)              # (V, HOLDOUT)
+    p10 = np.concatenate(pred_lo, axis=1)
+    p90 = np.concatenate(pred_hi, axis=1)
+    actual = series[:, CONTEXT_TRAIN:]                        # (V, HOLDOUT)
+
+    mae = float(np.mean(np.abs(median - actual)))
+    print(f"held-out {HOLDOUT}-day rolling MAE (median): {mae:.2f}")
     print("per-stock columns:", price_cols)
 
     t_full = np.arange(length)
@@ -170,13 +198,13 @@ def main() -> None:
     for v, ax in enumerate(axes):
         ax.plot(t_full[:CONTEXT_TRAIN], series[v, :CONTEXT_TRAIN], color="#1f77b4", label="history")
         ax.plot(t_full[CONTEXT_TRAIN:], series[v, CONTEXT_TRAIN:], color="#2ca02c", label="actual")
-        ax.plot(t_fc, median[v].cpu().numpy(), color="#d62728", label="forecast median")
-        ax.fill_between(t_fc, p10[v].cpu().numpy(), p90[v].cpu().numpy(), color="#d62728", alpha=0.2, label="10-90% band")
+        ax.plot(t_fc, median[v], color="#d62728", marker="o", ms=3, lw=1.5, label="rolling forecast (median)")
+        ax.fill_between(t_fc, p10[v], p90[v], color="#d62728", alpha=0.2, label="10-90% band")
         ax.axvline(CONTEXT_TRAIN, color="grey", ls="--", lw=1)
         ax.set_title(f"stock {v + 1}")
         ax.legend(loc="upper left")
     axes[-1].set_xlabel("time step (day)")
-    fig.suptitle("Stock close prices — Timestral fine-tune: 30-day held-out forecast")
+    fig.suptitle("Stock close prices — Timestral fine-tune: 30-day rolling (5-step) held-out forecast")
     fig.tight_layout()
     fig_path = OUT_DIR / "forecast.png"
     fig.savefig(fig_path, dpi=120)
