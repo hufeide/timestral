@@ -9,3 +9,4 @@ dist/
 train_example_out/
 train_air_out/
 train_stock_out/
+train_stock_index_out/
